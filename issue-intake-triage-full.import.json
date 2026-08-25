@@ -1,0 +1,302 @@
+{
+  "version": "1.0",
+  "activities": [
+    {
+      "id": "_start",
+      "next": "triage",
+      "type": "start",
+      "config": {
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "message"
+          ],
+          "properties": {
+            "sender": {
+              "type": "string"
+            },
+            "channel": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "screenshots": {
+              "type": "array",
+              "items": {
+                "type": "image"
+              },
+              "maxItems": 5
+            },
+            "conversation_id": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "triage",
+      "next": "route",
+      "type": "agent",
+      "config": {
+        "name": "Issue Triage (vision)",
+        "role": "Support issue triager",
+        "agent_id": "8c99d5cd-1378-4276-af05-e261f1fa5884",
+        "max_tokens": 4096,
+        "input_fields": {
+          "message": {
+            "type": "string",
+            "source": "input.message"
+          },
+          "screenshots": {
+            "type": "image",
+            "source": "input.screenshots"
+          }
+        },
+        "instructions": "You triage messages from a support Teams channel. You are given the message text and, when the reporter pasted them, one or more screenshots.\n\nAbout the screenshots field: when the reporter attached images you will SEE them as vision content and must read them. The text `screenshots` field is only a side note: if it is empty or contains a placeholder such as \"[Error loading file: ...]\", it just means NO image was attached. Never treat that placeholder as evidence, never mention it, and never let it change the verdict. Triage from the text alone in that case.\n\nRead BOTH the text and every actual screenshot together. Screenshots often carry the real signal: error dialogs, stack traces, failed screens, red banners, HTTP 4xx/5xx codes, and UI glitches all count as evidence of a problem.\n\nDecide one verdict:\n- issue: a genuine, specific bug/incident/problem report with enough detail to act on (what broke, where, and ideally when or how).\n- needs_info: it sounds like a real problem but is too vague to log (\"it is broken again\", \"not working\") with no system, no error, and no steps.\n- noise: casual chat, greetings, thanks, opinions, questions that are not problem reports.\n\nWhen in doubt between issue and noise, prefer noise. When it sounds like a problem but lacks specifics, choose needs_info rather than inventing detail.\n\nFill every output field. For noise, still return short placeholder values (verdict=noise). Base severity on real user impact: critical=outage/data loss, high=major feature broken for many, medium=broken for some or has a workaround, low=minor/cosmetic. affected_area is a short slug like \"billing/export\" or \"auth/login\". title is a short ticket title. summary is one clean line describing the problem, incorporating anything you saw in the screenshots. reason is one line explaining the verdict.",
+        "output_fields": {
+          "verdict": {
+            "type": "string",
+            "description": "Exactly one of: issue, needs_info, noise"
+          },
+          "title": {
+            "type": "string",
+            "description": "Short ticket title"
+          },
+          "summary": {
+            "type": "string",
+            "description": "One clean line describing the problem, including any screenshot insight"
+          },
+          "category": {
+            "type": "string",
+            "description": "One of: bug, incident, feature_request, question"
+          },
+          "severity": {
+            "type": "string",
+            "description": "One of: critical, high, medium, low (based on user impact)"
+          },
+          "affected_area": {
+            "type": "string",
+            "description": "Short area slug, e.g. billing/export or auth/login"
+          },
+          "reason": {
+            "type": "string",
+            "description": "One line explaining the verdict (auditable)"
+          }
+        },
+        "max_iterations": 10,
+        "kb_retrieval_mode": "auto",
+        "enabled_system_tools": []
+      }
+    },
+    {
+      "id": "route",
+      "type": "conditional",
+      "config": {
+        "condition_type": "variable",
+        "variable_path": "triage.verdict",
+        "operator": "match",
+        "branches": [
+          {
+            "goto": "build_ticket",
+            "label": "issue"
+          },
+          {
+            "goto": "build_clarify",
+            "label": "needs_info"
+          },
+          {
+            "goto": "noise_end",
+            "label": "noise"
+          }
+        ],
+        "default_branch": "noise"
+      }
+    },
+    {
+      "id": "build_ticket",
+      "next": "reply_ticket",
+      "type": "code",
+      "config": {
+        "name": "Build triaged ticket",
+        "code": "def run(inputs: Inputs) -> Outputs:\n    severity = (inputs.severity or \"\").strip().lower()\n    priority_sla = {\n        \"critical\": (\"P1\", \"2h\"),\n        \"high\": (\"P2\", \"4h\"),\n        \"medium\": (\"P3\", \"24h\"),\n        \"low\": (\"P4\", \"72h\"),\n    }\n    priority, sla = priority_sla.get(severity, (\"P3\", \"24h\"))\n\n    signal = ((inputs.affected_area or \"\") + \" \" + (inputs.category or \"\")).lower()\n    if any(k in signal for k in (\"export\", \"billing\", \"payment\", \"invoice\")):\n        owner = \"Billing squad\"\n    elif any(k in signal for k in (\"auth\", \"login\", \"sso\")):\n        owner = \"Platform squad\"\n    elif any(k in signal for k in (\"ui\", \"render\", \"frontend\")):\n        owner = \"Frontend squad\"\n    else:\n        owner = \"Triage / Support\"\n\n    title = (inputs.title or \"Untitled issue\").strip()\n    summary = (inputs.summary or \"\").strip()\n    category = (inputs.category or \"bug\").strip()\n    sev = severity or \"medium\"\n\n    lines = [\n        \"\\U0001F916 ISSUE logged\",\n        \"Title:    \" + title,\n        \"Category: \" + category + \"   |   Severity: \" + sev + \"   |   Priority: \" + priority + \"   |   SLA: \" + sla,\n        \"Owner:    \" + owner,\n        \"Summary:  \" + summary,\n    ]\n    return {\"response\": \"\\n\".join(lines)}\n",
+        "input_fields": {
+          "title": {
+            "type": "string",
+            "source": "triage.title"
+          },
+          "summary": {
+            "type": "string",
+            "source": "triage.summary"
+          },
+          "category": {
+            "type": "string",
+            "source": "triage.category"
+          },
+          "severity": {
+            "type": "string",
+            "source": "triage.severity"
+          },
+          "affected_area": {
+            "type": "string",
+            "source": "triage.affected_area"
+          }
+        },
+        "output_fields": {
+          "response": {
+            "type": "string",
+            "description": "Formatted ticket text to post back into Teams"
+          }
+        }
+      }
+    },
+    {
+      "id": "reply_ticket",
+      "next": "_end",
+      "type": "tool",
+      "config": {
+        "name": "Reply ticket in Teams",
+        "tool_name": "send_chat_message",
+        "input_fields": {
+          "chat_id": {
+            "source": "input.conversation_id"
+          },
+          "content": {
+            "source": "build_ticket.response"
+          },
+          "content_type": {
+            "default": "text"
+          }
+        },
+        "mcp_template": "microsoft-teams",
+        "connection_id": "1d004ae3-9ad8-4190-845c-f3f714b3167c",
+        "tool_input_schema": {
+          "type": "object",
+          "required": [
+            "content"
+          ],
+          "properties": {
+            "chat_id": {
+              "type": "string",
+              "description": "Existing chat ID from list_chats"
+            },
+            "content": {
+              "type": "string",
+              "description": "Message content"
+            },
+            "user_email": {
+              "type": "string",
+              "description": "Recipient email for a 1:1 chat (used when chat_id is omitted)"
+            },
+            "content_type": {
+              "enum": [
+                "text",
+                "html"
+              ],
+              "type": "string",
+              "default": "text",
+              "description": "Content format"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "build_clarify",
+      "next": "reply_clarify",
+      "type": "code",
+      "config": {
+        "name": "Build clarify ask",
+        "code": "def run(inputs: Inputs) -> Outputs:\n    summary = (inputs.summary or \"\").strip()\n    body = (\n        \"\\U0001F916 This looks like it might be an issue, but I need a bit more \"\n        \"detail to log it: which system, what you saw (error text or screenshot), \"\n        \"and the steps to reproduce.\"\n    )\n    if summary:\n        body = body + \"\\n\\nWhat I understood so far: \" + summary\n    return {\"response\": body}\n",
+        "input_fields": {
+          "summary": {
+            "type": "string",
+            "source": "triage.summary"
+          }
+        },
+        "output_fields": {
+          "response": {
+            "type": "string",
+            "description": "Clarify request to post back into Teams"
+          }
+        }
+      }
+    },
+    {
+      "id": "reply_clarify",
+      "next": "_end",
+      "type": "tool",
+      "config": {
+        "name": "Reply clarify in Teams",
+        "tool_name": "send_chat_message",
+        "input_fields": {
+          "chat_id": {
+            "source": "input.conversation_id"
+          },
+          "content": {
+            "source": "build_clarify.response"
+          },
+          "content_type": {
+            "default": "text"
+          }
+        },
+        "mcp_template": "microsoft-teams",
+        "connection_id": "1d004ae3-9ad8-4190-845c-f3f714b3167c",
+        "tool_input_schema": {
+          "type": "object",
+          "required": [
+            "content"
+          ],
+          "properties": {
+            "chat_id": {
+              "type": "string",
+              "description": "Existing chat ID from list_chats"
+            },
+            "content": {
+              "type": "string",
+              "description": "Message content"
+            },
+            "user_email": {
+              "type": "string",
+              "description": "Recipient email for a 1:1 chat (used when chat_id is omitted)"
+            },
+            "content_type": {
+              "enum": [
+                "text",
+                "html"
+              ],
+              "type": "string",
+              "default": "text",
+              "description": "Content format"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "noise_end",
+      "next": "_end",
+      "type": "code",
+      "config": {
+        "name": "Noise ack",
+        "code": "def run(inputs: Inputs) -> Outputs:\n    return {\"response\": \"Classified as NOISE. No action taken.\"}\n",
+        "input_fields": {},
+        "output_fields": {
+          "response": {
+            "type": "string",
+            "description": "Internal note; not posted to Teams"
+          }
+        }
+      }
+    },
+    {
+      "id": "_end",
+      "type": "end",
+      "config": {
+        "output_format": "json"
+      }
+    }
+  ],
+  "default_llm_config_id": "0f2559e3-f98a-4441-9a5f-1fa8062e60c6"
+}

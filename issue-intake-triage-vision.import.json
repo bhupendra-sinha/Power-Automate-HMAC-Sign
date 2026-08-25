@@ -1,0 +1,259 @@
+{
+  "export_version": "1.0",
+  "exported_at": "2026-08-24T00:00:00Z",
+  "use_case": {
+    "name": "Issue Intake Triage (vision)",
+    "description": "Triages support Teams messages (with optional screenshots) and replies in the Teams conversation on every outcome - both ISSUE and NOISE.",
+    "interface_type": "form",
+    "workflow_json": {
+      "version": "1.0",
+      "activities": [
+        {
+          "id": "_start",
+          "next": "triage_vision",
+          "type": "start",
+          "config": {
+            "input_schema": {
+              "type": "object",
+              "required": [
+                "message"
+              ],
+              "properties": {
+                "sender": {
+                  "type": "string"
+                },
+                "channel": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "screenshots": {
+                  "type": "array",
+                  "items": {
+                    "type": "image"
+                  },
+                  "maxItems": 5
+                },
+                "conversation_id": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "triage_vision",
+          "next": "route",
+          "type": "agent",
+          "config": {
+            "name": "Issue Triage (vision)",
+            "role": "Support issue classifier",
+            "agent_id": "8c99d5cd-1378-4276-af05-e261f1fa5884",
+            "max_tokens": 4096,
+            "input_fields": {
+              "message": {
+                "type": "string",
+                "source": "input.message"
+              },
+              "screenshots": {
+                "type": "image",
+                "source": "input.screenshots"
+              }
+            },
+            "instructions": "You triage messages from a support Teams channel. You may also be given one or more screenshots.\n\nDecide whether the message and any screenshots report a bug, incident, or problem that needs action. Casual chat, greetings, thanks, questions, and opinions are NOT reports.\n\nIf screenshots are attached, read them: error dialogs, stack traces, failed screens, and UI glitches count as issues.\n\nReturn is_issue = true ONLY for genuine problem reports, and a single-line summary of the problem that incorporates anything relevant you saw in the screenshots.",
+            "output_fields": {
+              "summary": {
+                "type": "string",
+                "description": "One-line summary of the problem, including any screenshot insight"
+              },
+              "is_issue": {
+                "type": "boolean",
+                "description": "True only for genuine bug/incident/problem reports"
+              }
+            },
+            "max_iterations": 10,
+            "kb_retrieval_mode": "auto",
+            "enabled_system_tools": []
+          }
+        },
+        {
+          "id": "route",
+          "type": "conditional",
+          "config": {
+            "branches": [
+              {
+                "goto": "build_reply",
+                "label": "issue"
+              },
+              {
+                "goto": "noise_end",
+                "label": "noise"
+              }
+            ],
+            "operator": "equals",
+            "compare_value": true,
+            "variable_path": "triage_vision.is_issue",
+            "condition_type": "variable",
+            "default_branch": "noise"
+          }
+        },
+        {
+          "id": "build_reply",
+          "next": "reply_teams",
+          "type": "code",
+          "config": {
+            "code": "def run(inputs: Inputs) -> Outputs:\n    return {\"response\": \"Classified as ISSUE. Queued for triage: \" + inputs.summary}\n",
+            "name": "Build issue reply",
+            "input_fields": {
+              "summary": {
+                "type": "string",
+                "source": "triage_vision.summary",
+                "description": "Problem summary from the vision agent"
+              }
+            },
+            "output_fields": {
+              "response": {
+                "type": "string",
+                "description": "Reply text to post back into Teams"
+              }
+            }
+          }
+        },
+        {
+          "id": "reply_teams",
+          "next": "_end",
+          "type": "tool",
+          "config": {
+            "name": "Reply in Teams",
+            "tool_name": "send_chat_message",
+            "input_fields": {
+              "chat_id": {
+                "source": "input.conversation_id"
+              },
+              "content": {
+                "source": "build_reply.response"
+              },
+              "content_type": {
+                "default": "text"
+              }
+            },
+            "mcp_template": "microsoft-teams",
+            "connection_id": "1d004ae3-9ad8-4190-845c-f3f714b3167c",
+            "tool_input_schema": {
+              "type": "object",
+              "required": [
+                "content"
+              ],
+              "properties": {
+                "chat_id": {
+                  "type": "string",
+                  "description": "Existing chat ID from list_chats"
+                },
+                "content": {
+                  "type": "string",
+                  "description": "Message content"
+                },
+                "user_email": {
+                  "type": "string",
+                  "description": "Recipient email for a 1:1 chat (used when chat_id is omitted)"
+                },
+                "content_type": {
+                  "enum": [
+                    "text",
+                    "html"
+                  ],
+                  "type": "string",
+                  "default": "text",
+                  "description": "Content format"
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "noise_end",
+          "next": "reply_teams_noise",
+          "type": "code",
+          "config": {
+            "code": "def run(inputs: Inputs) -> Outputs:\n    return {\"response\": \"Classified as NOISE. No ticket created.\"}\n",
+            "name": "Noise ack",
+            "input_fields": {},
+            "output_fields": {
+              "response": {
+                "type": "string",
+                "description": "Acknowledgement text to post back into Teams"
+              }
+            }
+          }
+        },
+        {
+          "id": "reply_teams_noise",
+          "next": "_end",
+          "type": "tool",
+          "config": {
+            "name": "Reply in Teams (noise)",
+            "tool_name": "send_chat_message",
+            "input_fields": {
+              "chat_id": {
+                "source": "input.conversation_id"
+              },
+              "content": {
+                "source": "noise_end.response"
+              },
+              "content_type": {
+                "default": "text"
+              }
+            },
+            "mcp_template": "microsoft-teams",
+            "connection_id": "1d004ae3-9ad8-4190-845c-f3f714b3167c",
+            "tool_input_schema": {
+              "type": "object",
+              "required": [
+                "content"
+              ],
+              "properties": {
+                "chat_id": {
+                  "type": "string",
+                  "description": "Existing chat ID from list_chats"
+                },
+                "content": {
+                  "type": "string",
+                  "description": "Message content"
+                },
+                "user_email": {
+                  "type": "string",
+                  "description": "Recipient email for a 1:1 chat (used when chat_id is omitted)"
+                },
+                "content_type": {
+                  "enum": [
+                    "text",
+                    "html"
+                  ],
+                  "type": "string",
+                  "default": "text",
+                  "description": "Content format"
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "_end",
+          "type": "end",
+          "config": {
+            "output_format": "json"
+          }
+        }
+      ],
+      "default_llm_config_id": "0f2559e3-f98a-4441-9a5f-1fa8062e60c6"
+    }
+  },
+  "agents": [],
+  "dependencies": {
+    "mcp_templates": [
+      "microsoft-teams"
+    ],
+    "llm_config_names": []
+  }
+}
