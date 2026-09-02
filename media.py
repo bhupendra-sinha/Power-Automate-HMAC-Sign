@@ -1,9 +1,11 @@
-"""Decode PA-supplied images and upload them to the hook /files endpoint.
+"""Decode PA-supplied images/files and upload them to the hook /files endpoint.
 
-Power Automate fetches each inline ``hostedContents`` image from Graph itself
-(its own delegated Teams connection) and posts them to the shim as base64. This
-module decodes them and uploads them as ``screenshots`` file_ids for the vision
-agent. Degrades to text-only ([]) on any failure so the workflow always fires.
+Power Automate fetches each inline ``hostedContents`` image (via its delegated
+Teams connection) and each attached document (via the SharePoint/OneDrive
+connector) and posts them to the shim as base64. This module decodes them and
+uploads them: images become ``screenshots`` file_ids for the vision agent,
+documents become ``documents`` file_ids for the START node. Degrades to
+text-only ([]) on any failure so the workflow always fires.
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ from signing import sign
 
 MAX_IMAGES = 5
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_FILES = 3
+MAX_FILE_BYTES = 50 * 1024 * 1024
 IMAGE_TYPES = {
     "image/png",
     "image/jpeg",
@@ -38,6 +42,22 @@ _EXT_BY_CONTENT_TYPE = {
     "image/gif": "gif",
     "image/tiff": "tiff",
 }
+# Allowed document extensions -> the content type we send. Deriving it from the
+# extension keeps the /files check happy and enforces the whitelist (unknown
+# extensions are skipped).
+_FILE_CONTENT_TYPE_BY_EXT = {
+    "pdf": "application/pdf",
+    "doc": "application/msword",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xls": "application/vnd.ms-excel",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "ppt": "application/vnd.ms-powerpoint",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "csv": "text/csv",
+    "txt": "text/plain",
+    "md": "text/markdown",
+    "json": "application/json",
+}
 
 
 @dataclass(frozen=True)
@@ -48,72 +68,98 @@ class MediaConfig:
     api_key_secret: str
 
 
-async def _upload_images(
-    client: httpx.AsyncClient, images: list[dict[str, Any]], cfg: MediaConfig
-) -> list[str]:
-    """Upload image bytes to the hook file endpoint; return file_ids.
+def _decode_b64(item: dict[str, Any]) -> bytes | None:
+    """Decode an item's base64 content, tolerating PA's stray whitespace.
 
-    Skips non-image content types and anything over the size cap, and caps the
-    count. The vision agent reads the image at runtime, so we upload with
-    extract_text=false. File uploads are HMAC signed over an EMPTY body, per the
-    /files endpoint contract.
+    Returns the bytes, or None if the base64 is malformed.
     """
-    file_ids: list[str] = []
-    for img in images[:MAX_IMAGES]:
-        content = img.get("content") or b""
-        content_type = (img.get("contentType") or "").lower()
-        if content_type not in IMAGE_TYPES or not content or len(content) > MAX_IMAGE_BYTES:
-            continue
-        timestamp = str(int(time.time()))
-        resp = await client.post(
-            cfg.files_url,
-            params={"extract_text": "false"},
-            files={"file": (img.get("filename") or "screenshot.png", content, content_type)},
-            headers={
-                "X-Timestamp": timestamp,
-                "X-Signature": sign(cfg.api_key_secret, timestamp, b""),
-            },
-        )
-        if resp.status_code < 300:
-            fid = resp.json().get("file_id")
-            if fid:
-                file_ids.append(fid)
-    return file_ids
+    raw = "".join((item.get("contentBytes") or item.get("contentBase64") or "").split())
+    try:
+        return base64.b64decode(raw, validate=True) if raw else b""
+    except (ValueError, binascii.Error):
+        return None
+
+
+async def _post_one(
+    client: httpx.AsyncClient,
+    cfg: MediaConfig,
+    filename: str,
+    content: bytes,
+    content_type: str,
+) -> str | None:
+    """HMAC-POST one file to the hook /files endpoint; return its file_id.
+
+    Uploads with extract_text=false (the START node / vision agent handle
+    extraction). File uploads are HMAC signed over an EMPTY body, per contract.
+    """
+    timestamp = str(int(time.time()))
+    resp = await client.post(
+        cfg.files_url,
+        params={"extract_text": "false"},
+        files={"file": (filename, content, content_type)},
+        headers={
+            "X-Timestamp": timestamp,
+            "X-Signature": sign(cfg.api_key_secret, timestamp, b""),
+        },
+    )
+    if resp.status_code < 300:
+        return resp.json().get("file_id")
+    return None
 
 
 async def upload_pa_images(
     client: httpx.AsyncClient, images_b64: Any, cfg: MediaConfig
 ) -> list[str]:
-    """Upload base64 images that Power Automate fetched from Graph itself.
+    """Upload base64 images PA fetched from Graph (hostedContents).
 
-    PA GETs each inline ``hostedContents/$value`` via its own delegated Teams
-    connection (no shim token) and posts them as a list of
-    ``{filename, contentType, contentBytes}`` where ``contentBytes`` is base64.
-    We decode and hand them to the same /files uploader. Returns [] on none or
-    on any malformed item, so the workflow still fires text-only.
+    Each item is ``{filename, contentType, contentBytes}``. We rename by content
+    type so the /files extension check passes, skip non-image or oversized
+    items, and cap the count. Returns [] on none, so the workflow still fires.
     """
     if not isinstance(images_b64, list):
         return []
-    decoded: list[dict[str, Any]] = []
+    file_ids: list[str] = []
     for item in images_b64[:MAX_IMAGES]:
         if not isinstance(item, dict):
             continue
-        # Strip whitespace PA's JSON formatting can leave around the tokens:
-        # a stray space breaks base64 decode and content-type matching.
-        raw = "".join((item.get("contentBytes") or item.get("contentBase64") or "").split())
-        try:
-            content = base64.b64decode(raw, validate=True) if raw else b""
-        except (ValueError, binascii.Error):
-            continue
-        if not content:
+        content = _decode_b64(item)
+        if not content or len(content) > MAX_IMAGE_BYTES:
             continue
         content_type = (item.get("contentType") or "image/png").strip().lower()
-        decoded.append(
-            {
-                "content": content,
-                "contentType": content_type,
-                # Name by content type so the /files extension check passes.
-                "filename": f"screenshot.{_EXT_BY_CONTENT_TYPE.get(content_type, 'png')}",
-            }
-        )
-    return await _upload_images(client, decoded, cfg)
+        if content_type not in IMAGE_TYPES:
+            continue
+        filename = f"screenshot.{_EXT_BY_CONTENT_TYPE[content_type]}"
+        fid = await _post_one(client, cfg, filename, content, content_type)
+        if fid:
+            file_ids.append(fid)
+    return file_ids
+
+
+async def upload_pa_files(
+    client: httpx.AsyncClient, files_b64: Any, cfg: MediaConfig
+) -> list[str]:
+    """Upload base64 documents PA fetched from OneDrive/SharePoint.
+
+    Each item is ``{filename, contentBytes}``. We derive the content type from
+    the filename extension (matching the /files check and enforcing the
+    allowed-type whitelist), skip unknown types and oversized files, and cap the
+    count. Returns [] on none, so the workflow still fires text-only.
+    """
+    if not isinstance(files_b64, list):
+        return []
+    file_ids: list[str] = []
+    for item in files_b64[:MAX_FILES]:
+        if not isinstance(item, dict):
+            continue
+        content = _decode_b64(item)
+        if not content or len(content) > MAX_FILE_BYTES:
+            continue
+        name = (item.get("filename") or "").strip()
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        content_type = _FILE_CONTENT_TYPE_BY_EXT.get(ext)
+        if not content_type:
+            continue
+        fid = await _post_one(client, cfg, name, content, content_type)
+        if fid:
+            file_ids.append(fid)
+    return file_ids

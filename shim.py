@@ -29,7 +29,7 @@ import approvals
 import seen_messages
 from hitl import HookAuth, await_triage_outcome, respond_to_pending
 from mapping import build_input, message_html, parse_decision, strip_html
-from media import MediaConfig, upload_pa_images
+from media import MediaConfig, upload_pa_files, upload_pa_images
 from signing import sign
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -111,6 +111,9 @@ async def forward(
         file_ids = await upload_pa_images(client, payload.get("images") or [], MEDIA_CONFIG)
         if file_ids:
             trigger_input["screenshots"] = file_ids
+        doc_ids = await upload_pa_files(client, payload.get("files") or [], MEDIA_CONFIG)
+        if doc_ids:
+            trigger_input["documents"] = doc_ids
 
         # Serialize ONCE and sign those exact bytes (re-serializing breaks the sig).
         body = json.dumps(
