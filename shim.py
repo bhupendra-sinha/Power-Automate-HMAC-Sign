@@ -91,8 +91,11 @@ async def forward(
     if BOT_MARKER in html:
         return {"status": "ignored_bot"}
 
-    # The approval card PA posts re-fires this trigger but carries no plain text.
-    if not strip_html(html):
+    # The approval card PA re-fires this trigger with no plain text. Skip such
+    # empty messages, but NOT media-only ones (a file/image with no caption is
+    # still a real message), so check the payload for attached media first.
+    has_media = bool(payload.get("images") or payload.get("files"))
+    if not strip_html(html) and not has_media:
         return {"status": "ignored_empty"}
 
     # A decision reply for a conversation with a pending draft is handled by
