@@ -5,6 +5,10 @@
 .env.*.local
 *.env
 
+# Local runtime state / secrets (never commit)
+.approvals.json
+.seen_messages.json
+
 # Python
 __pycache__/
 *.py[cod]

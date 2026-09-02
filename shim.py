@@ -4,9 +4,8 @@ Power Automate cannot compute HMAC, so it POSTs the raw Teams message here with
 a shared-secret header. This shim builds the hook body, signs it exactly as
 MagOneAI expects, and forwards it to the /hooks endpoint.
 
-Inline Teams images (pasted screenshots) arrive in the message body as
-hostedContents URLs. Power Automate cannot fetch those (connector whitelist), so
-the shim fetches the bytes itself with a reused delegated Graph token and
+Inline Teams images (pasted screenshots) are fetched by Power Automate itself
+(its delegated Teams connection) and posted here as base64; the shim decodes and
 uploads them as ``screenshots`` before firing the workflow. Local-test grade:
 run behind ngrok, never ship to production as-is.
 
@@ -26,18 +25,12 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request, status
 
-from graph import (
-    GraphConfig,
-    extract_hosted_content_urls,
-    fetch_teams_images,
-    get_graph_token,
-)
-from mapping import build_input, interpret_result, message_html
+import approvals
+import seen_messages
+from hitl import HookAuth, await_triage_outcome, respond_to_pending
+from mapping import build_input, message_html, parse_decision, strip_html
+from media import MediaConfig, upload_pa_images
 from signing import sign
-
-MAX_IMAGES = 5
-MAX_IMAGE_BYTES = 20 * 1024 * 1024
-IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif", "image/tiff"}
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -48,62 +41,23 @@ API_KEY_SECRET = os.environ["API_KEY_SECRET"]
 USE_CASE_ID = os.environ["USE_CASE_ID"]
 SHARED_SECRET = os.environ["SHARED_SECRET"]
 
-GRAPH_CONFIG = GraphConfig(
-    tenant_id=os.getenv("TENANT_ID", ""),
-    client_id=os.getenv("CLIENT_ID", ""),
-    client_secret=os.getenv("CLIENT_SECRET", ""),
-    refresh_token=os.getenv("TEAMS_REFRESH_TOKEN", ""),
-    scope=os.getenv("GRAPH_SCOPE", "https://graph.microsoft.com/.default"),
+HOOK_URL = f"{MAGONE_BASE_URL}{MAGONE_HOOK_PATH}/{API_KEY_ID}"
+HOOK_AUTH = HookAuth(
+    hook_url=HOOK_URL,
+    poll_base=f"{MAGONE_BASE_URL}/api/v1/poll",
+    api_key_secret=API_KEY_SECRET,
+)
+MEDIA_CONFIG = MediaConfig(
+    files_url=f"{HOOK_URL}/files",
+    api_key_secret=API_KEY_SECRET,
 )
 
-HOOK_URL = f"{MAGONE_BASE_URL}{MAGONE_HOOK_PATH}/{API_KEY_ID}"
-FILES_URL = f"{HOOK_URL}/files"
+# Every message the use case posts to Teams is prefixed with this marker; both
+# endpoints skip inbound messages containing it so the bot's own draft / created
+# / discarded posts never re-trigger triage or self-answer the approval task.
+BOT_MARKER = "\U0001F916"  # robot emoji
 
 app = FastAPI(title="teams-trigger-signer-shim")
-
-
-async def upload_images(client: httpx.AsyncClient, images: list[dict[str, Any]]) -> list[str]:
-    """Upload image bytes to the hook file endpoint; return file_ids.
-
-    Skips non-image content types and anything over the size cap, and caps the
-    count. The vision agent reads the image at runtime, so we upload with
-    extract_text=false (no upload-time OCR). File uploads are HMAC signed over an
-    EMPTY body, per the /files endpoint contract.
-    """
-    file_ids: list[str] = []
-    for img in images[:MAX_IMAGES]:
-        content = img.get("content") or b""
-        content_type = (img.get("contentType") or "").lower()
-        if content_type not in IMAGE_TYPES or not content or len(content) > MAX_IMAGE_BYTES:
-            continue
-        timestamp = str(int(time.time()))
-        resp = await client.post(
-            FILES_URL,
-            params={"extract_text": "false"},
-            files={"file": (img.get("filename") or "screenshot.png", content, content_type)},
-            headers={"X-Timestamp": timestamp, "X-Signature": sign(API_KEY_SECRET, timestamp, b"")},
-        )
-        if resp.status_code < 300:
-            fid = resp.json().get("file_id")
-            if fid:
-                file_ids.append(fid)
-    return file_ids
-
-
-async def resolve_screenshots(client: httpx.AsyncClient, html: str) -> list[str]:
-    """Fetch inline Teams images from the message HTML and upload them.
-
-    Returns [] (text-only) when there are no inline images or Graph creds are
-    not configured, so the workflow always runs.
-    """
-    urls = extract_hosted_content_urls(html)
-    if not urls:
-        return []
-    token = await get_graph_token(client, GRAPH_CONFIG)
-    if not token:
-        return []
-    images = await fetch_teams_images(client, urls[:MAX_IMAGES], token)
-    return await upload_images(client, images)
 
 
 @app.get("/health")
@@ -113,7 +67,6 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "hook_url": HOOK_URL,
         "use_case_id": USE_CASE_ID,
-        "graph_images_enabled": GRAPH_CONFIG.is_configured,
     }
 
 
@@ -124,8 +77,7 @@ async def forward(
 ) -> dict[str, Any]:
     """Authenticate the caller, fetch inline images, sign, forward to MagOneAI."""
     if not hmac.compare_digest(x_shared_secret, SHARED_SECRET):
-        # Collapse to 404 so the endpoint does not confirm it exists.
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")  # 404: hide existence
 
     try:
         payload = await request.json()
@@ -136,24 +88,39 @@ async def forward(
     if not html:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "message or message_b64 is required")
 
+    if BOT_MARKER in html:
+        return {"status": "ignored_bot"}
+
+    # The approval card PA posts re-fires this trigger but carries no plain text.
+    if not strip_html(html):
+        return {"status": "ignored_empty"}
+
+    # A decision reply for a conversation with a pending draft is handled by
+    # /approve, so skip triage here (avoids a second run on "approve"/"reject").
+    conversation_id = payload.get("conversation_id", "")
+    if conversation_id and parse_decision(html) and approvals.lookup(conversation_id):
+        return {"status": "approval_reply_skipped"}
+
+    # Teams delivers each message 2x (image messages); dedup by message_id.
+    if seen_messages.already_seen(payload.get("message_id", "")):
+        return {"status": "duplicate_skipped"}
+
     trigger_input = build_input(payload)
 
-    # wait=true blocks until the workflow finishes and returns its output, so we
-    # can tell Power Automate whether to reply. Falls back to 202 on timeout.
-    async with httpx.AsyncClient(timeout=90.0) as client:
-        file_ids = await resolve_screenshots(client, html)
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        file_ids = await upload_pa_images(client, payload.get("images") or [], MEDIA_CONFIG)
         if file_ids:
             trigger_input["screenshots"] = file_ids
 
-        # Serialize ONCE and sign the exact bytes we send - re-serializing would
-        # change whitespace/key order and break the signature.
+        # Serialize ONCE and sign those exact bytes (re-serializing breaks the sig).
         body = json.dumps(
             {"use_case_id": USE_CASE_ID, "input": trigger_input}, separators=(",", ":")
         ).encode()
         timestamp = str(int(time.time()))
+        # Trigger WITHOUT wait: we poll ourselves so the card posts soon after the
+        # run parks (wait=true would block the full 60s sync timeout).
         resp = await client.post(
             HOOK_URL,
-            params={"wait": "true"},
             content=body,
             headers={
                 "Content-Type": "application/json",
@@ -161,11 +128,61 @@ async def forward(
                 "X-Signature": sign(API_KEY_SECRET, timestamp, body),
             },
         )
+        if resp.status_code >= 400:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                f"hook returned {resp.status_code}: {resp.text[:300]}",
+            )
 
-    if resp.status_code >= 400:
-        raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY,
-            f"hook returned {resp.status_code}: {resp.text[:300]}",
+        poll_token = resp.json().get("poll_token")
+        if not poll_token:
+            return {"status": "no_poll_token"}
+
+        # awaiting_approval (+ draft) when the issue path parks, else a terminal
+        # status. Remember the token so /approve can resolve the parked task.
+        outcome = await await_triage_outcome(client, HOOK_AUTH, poll_token, conversation_id)
+        if outcome.get("status") == "awaiting_approval" and conversation_id:
+            approvals.remember(conversation_id, poll_token)
+        return outcome
+
+
+@app.post("/approve")
+async def approve(
+    request: Request,
+    x_shared_secret: str = Header(default="", alias="X-Shared-Secret"),
+) -> dict[str, Any]:
+    """Match a Teams Approve/Reject reply to its paused run and answer the task.
+
+    Power Automate fires this on any channel message that reads as a decision.
+    We look up the conversation's poll token, poll for the pending task id, then
+    HMAC-respond to the human-task webhook. The workflow resumes and posts the
+    created/discarded message back into Teams itself, so we post nothing here.
+    """
+    if not hmac.compare_digest(x_shared_secret, SHARED_SECRET):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Body must be JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Body must be a JSON object")
+
+    conversation_id = payload.get("conversation_id", "")
+    if not conversation_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "conversation_id is required")
+
+    message_text = message_html(payload) or payload.get("message", "")
+    if BOT_MARKER in message_text:
+        # Never answer the approval task from the bot's own draft, which contains
+        # the words "Approve"/"Reject" and would otherwise auto-approve itself.
+        return {"status": "ignored_bot"}
+
+    decision = payload.get("decision") or parse_decision(message_text)
+    if decision not in ("Approve", "Reject"):
+        return {"status": "not_a_decision"}
+
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        return await respond_to_pending(
+            client, HOOK_AUTH, {"conversation_id": conversation_id, "decision": decision}
         )
-
-    return interpret_result(resp.json())

@@ -1,7 +1,7 @@
-"""HMAC signing shared by the shim and the Graph media path.
+"""HMAC signing shared by the shim and the media upload path.
 
-Kept in its own module so both ``shim.py`` and ``graph.py`` can import it
-without a circular dependency. Matches MagOneAI's ApiKeyService.verify_signature:
+Kept in its own module so ``shim.py`` and ``media.py`` can import it without a
+circular dependency. Matches MagOneAI's ApiKeyService.verify_signature:
 message = f"{timestamp}." + body, HMAC-SHA256, hex digest.
 """
 

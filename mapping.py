@@ -37,6 +37,27 @@ def message_html(payload: dict[str, Any]) -> str:
     return payload.get("message", "")
 
 
+_APPROVE_WORDS = {"approve", "approved", "yes", "ok", "okay", "confirm", "✅"}
+_REJECT_WORDS = {"reject", "rejected", "no", "cancel", "discard", "deny", "❌"}
+
+
+def parse_decision(text: str) -> str | None:
+    """Map a Teams reply to an approval answer.
+
+    Returns "Approve" or "Reject" (the labels the HUMAN_TASK approval branches
+    match on), or None when the message is not an approval command. Matches the
+    first decision word found, so "approve please" or a leading emoji both work.
+    """
+    words = strip_html(text or "").lower().split()
+    for word in words:
+        token = word.strip(".,!:;()")
+        if token in _APPROVE_WORDS:
+            return "Approve"
+        if token in _REJECT_WORDS:
+            return "Reject"
+    return None
+
+
 def build_input(payload: dict[str, Any]) -> dict[str, Any]:
     """Map the Power Automate payload onto the use case's START input."""
     return {
@@ -44,24 +65,4 @@ def build_input(payload: dict[str, Any]) -> dict[str, Any]:
         "sender": payload.get("sender", ""),
         "channel": payload.get("channel", ""),
         "conversation_id": payload.get("conversation_id", ""),
-    }
-
-
-def interpret_result(data: dict[str, Any]) -> dict[str, Any]:
-    """Turn the /hooks response into a reply decision for Power Automate.
-
-    ``is_issue`` drives whether Power Automate posts back into Teams; ``reply``
-    is the text to post. On a sync-wait timeout the status is not "completed"
-    and ``is_issue`` stays False so we do not reply to an unknown result.
-    """
-    output = data.get("output") or {}
-    reply = str(output.get("response", "")) if isinstance(output, dict) else ""
-    completed = data.get("status") == "completed"
-    is_issue = completed and "Classified as ISSUE" in reply
-    return {
-        "is_issue": is_issue,
-        "classification": "issue" if is_issue else "noise",
-        "reply": reply,
-        "status": data.get("status"),
-        "execution_id": data.get("execution_id"),
     }

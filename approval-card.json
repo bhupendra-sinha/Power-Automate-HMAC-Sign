@@ -1,0 +1,21 @@
+{
+  "type": "AdaptiveCard",
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "version": "1.4",
+  "body": [
+    { "type": "TextBlock", "text": "Approval required", "weight": "Bolder", "size": "Medium" },
+    { "type": "TextBlock", "text": "@{body('HTTP')?['title']}", "weight": "Bolder", "wrap": true },
+    { "type": "FactSet", "facts": [
+      { "title": "Category", "value": "@{body('HTTP')?['category']}" },
+      { "title": "Severity", "value": "@{body('HTTP')?['severity']}" },
+      { "title": "Priority", "value": "@{body('HTTP')?['priority']}" },
+      { "title": "SLA", "value": "@{body('HTTP')?['sla']}" },
+      { "title": "Owner", "value": "@{body('HTTP')?['owner']}" }
+    ]},
+    { "type": "TextBlock", "text": "@{body('HTTP')?['summary']}", "wrap": true }
+  ],
+  "actions": [
+    { "type": "Action.Submit", "title": "Approve", "style": "positive", "data": { "decision": "Approve" } },
+    { "type": "Action.Submit", "title": "Reject", "style": "destructive", "data": { "decision": "Reject" } }
+  ]
+}

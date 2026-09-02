@@ -1,14 +1,28 @@
 # Teams trigger kit (local, scratch)
 
-Bridges a Teams channel message to the MagOneAI "Issue Intake & Triage" use case.
+Bridges a Teams channel message to the MagOneAI "Issue Intake & Triage" use case,
+with a human-in-the-loop approval step before a ticket is "created".
 
 ```
-Teams message -> Power Automate (grab + forward) -> shim (HMAC sign) -> /hooks -> workflow
+Report:   Teams message -> Power Automate -> shim /forward (HMAC) -> /hooks -> workflow
+              triage -> (issue) post DRAFT to Teams -> HUMAN_TASK approval PARKS
+                                                          (shim stores conv -> poll_token)
+Approve:  "Approve"/"Reject" in Teams -> Power Automate -> shim /approve
+              -> poll -> respond webhook -> workflow RESUMES
+                 Approve -> create (placeholder) -> post "Created" to Teams
+                 Reject  -> post "Discarded" to Teams
 ```
 
 The shim exists only because Power Automate cannot compute an HMAC signature.
 It authenticates Power Automate with a shared secret, then signs the hook body
 with the API key secret and forwards it to MagOneAI. Local-test grade only.
+
+The approval step uses the platform's native human-in-the-loop: the `HUMAN_TASK`
+approval node pauses the run (execution -> `WAITING_FOR_INPUT`), the trigger
+returns a `poll_token`, and the shim later reads `pending_human_task_ids` from
+the poll endpoint and answers the task via the HMAC-signed `respond` webhook.
+The `create` step is a **placeholder** for now (posts the approved payload); swap
+it for a real Jira MCP `create_issue` TOOL once a Jira connection exists.
 
 ## Setup
 
@@ -72,6 +86,48 @@ There is **no** "Send a Microsoft Graph HTTP request" node. That connector's
 whitelist rejects `hostedContents`, so delete it: the shim fetches the image
 bytes itself (see below). No condition needed either - the classifier lives in
 the use case.
+
+**Loop guard.** Every message the bot posts starts with `🤖`. The trigger must
+skip any incoming message whose content contains `🤖`, so the bot's own draft,
+"Created", and "Discarded" replies never re-fire the flow. Your plain
+"Approve"/"Reject" reply has no `🤖`, so it fires normally.
+
+## Human-in-the-loop approval (Approve/Reject in Teams)
+
+When triage decides `issue`, the workflow posts a **draft ticket** to Teams and
+then pauses on a `HUMAN_TASK` approval node. To approve or reject from Teams, add
+a **second HTTP action branch** in the same Power Automate flow (or a second
+flow) on the same message trigger:
+
+- Condition: the message text is a decision (e.g. contains `Approve` or `Reject`)
+  and does **not** contain `🤖`.
+- Action: **HTTP** POST to `<ngrok>/approve`
+  - Header `X-Shared-Secret`: your `SHARED_SECRET`
+  - Header `Content-Type`: `application/json`
+  - Body:
+    ```json
+    {
+      "conversation_id": "@{first(triggerBody()?['value'])?['conversationId']}",
+      "message_b64": "@{base64(outputs('Get_message_details')?['body/body/content'])}"
+    }
+    ```
+
+The shim maps the reply to the paused run by `conversation_id` (it stored the
+`poll_token` when the run parked), polls for the pending task id, and answers the
+`respond` webhook with `{"answers":{"approval":"Approve"}}`. The workflow resumes
+and posts the outcome to Teams itself, so this branch needs no reply action.
+
+You can also send an explicit decision instead of the raw message:
+`{"conversation_id":"...","decision":"Approve"}`. Test without Teams:
+
+```bash
+curl -s -X POST http://localhost:8790/approve \
+  -H "Content-Type: application/json" -H "X-Shared-Secret: <SHARED_SECRET>" \
+  -d '{"conversation_id":"<same id you triggered with>","decision":"Approve"}'
+```
+
+Expect `{"status":"responded","decision":"Approve",...}`. If nothing is pending
+you get `{"status":"no_pending_approval"}` (safe no-op).
 
 ## Inline images (pasted screenshots)
 
